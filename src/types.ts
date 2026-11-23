@@ -111,8 +111,11 @@ export interface RealCommuter {
   vehiclePreference: 'cab' | 'private' | 'any';
   distanceFromUserKm: number;
   distanceFromUserMeters?: number;
+  distanceUncertaintyMeters?: number;
   coordsAccuracyMeters?: number | null;
   locationSource?: 'gps' | 'ip' | 'manual' | 'default';
+  locationStatus?: string;
+  locationFixTimestamp?: number;
   routeMatchPercent: number;
 }
 

@@ -63,6 +63,8 @@ interface LiveCommuterPresence {
   lastSeenAt: number;
   coordsAccuracyMeters?: number | null;
   locationSource?: 'gps' | 'ip' | 'manual' | 'default';
+  locationStatus?: string;
+  locationFixTimestamp?: number;
   spawnedByDeviceId?: string;
 }
 
@@ -84,7 +86,7 @@ interface LiveLinkUpSession {
     drop: string;
     coords: { lat: number; lng: number };
   };
-  status: 'pending' | 'accepted' | 'declined' | 'cancelled';
+  status: 'pending' | 'accepted' | 'declined' | 'cancelled' | 'expired' | 'completed';
   createdAt: number;
   acceptedAt?: number;
   cancelledAt?: number;
@@ -183,7 +185,7 @@ setInterval(async () => {
   const now = new Date().toISOString();
   await Promise.all([
     supabaseAdmin.from('carpool_presence').delete().lt('expires_at', now),
-    supabaseAdmin.from('carpool_linkup_sessions').delete().lt('expires_at', now),
+    supabaseAdmin.from('carpool_linkup_sessions').delete().lt('expires_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()),
     supabaseAdmin.from('carpool_call_signals').delete().lt('expires_at', now),
   ]);
 }, 60_000).unref();
@@ -212,6 +214,8 @@ app.post('/api/carpool/presence', async (req: AuthenticatedRequest, res: Respons
       vehiclePreference,
       coordsAccuracyMeters,
       locationSource,
+      locationStatus,
+      locationFixTimestamp,
       spawnedByDeviceId
     } = req.body;
     if (!isValidDeviceId(deviceId) || !pickupCoords || !dropCoords) {
@@ -238,6 +242,15 @@ app.post('/api/carpool/presence', async (req: AuthenticatedRequest, res: Respons
     if (![nextLat, nextLng, dropLat, dropLng].every(Number.isFinite) || Math.abs(nextLat) > 90 || Math.abs(dropLat) > 90 || Math.abs(nextLng) > 180 || Math.abs(dropLng) > 180) {
       return res.status(400).json({ success: false, message: 'Valid pickup and drop coordinates are required.' });
     }
+    if (!['gps', 'ip', 'manual'].includes(locationSource)) {
+      return res.status(400).json({ success: false, code: 'LOCATION_UNCONFIRMED', message: 'Choose GPS, approximate network, or a manual area before going online.' });
+    }
+    if (locationSource === 'gps' && (!Number.isFinite(locationFixTimestamp) || Date.now() - Number(locationFixTimestamp) > 90_000 || Number(locationFixTimestamp) > Date.now() + 30_000)) {
+      return res.status(409).json({ success: false, code: 'LOCATION_STALE', message: 'Your GPS fix is stale. Refresh your location before broadcasting.' });
+    }
+    if (coordsAccuracyMeters != null && (!Number.isFinite(coordsAccuracyMeters) || coordsAccuracyMeters < 0 || coordsAccuracyMeters > 50_000)) {
+      return res.status(400).json({ success: false, code: 'LOCATION_ACCURACY_INVALID', message: 'Location accuracy value is invalid.' });
+    }
     const presence: LiveCommuterPresence = {
       deviceId,
       username: req.authUsername || 'Commuter',
@@ -259,6 +272,8 @@ app.post('/api/carpool/presence', async (req: AuthenticatedRequest, res: Respons
       coordsAccuracyMeters:
         typeof coordsAccuracyMeters === 'number' ? Math.round(coordsAccuracyMeters) : null,
       locationSource: locationSource || undefined,
+      locationStatus: locationStatus || 'active',
+      locationFixTimestamp: Number(locationFixTimestamp) || Date.now(),
       ...(spawnedByDeviceId ? { spawnedByDeviceId } : {})
     };
     const ttlMs = spawnedByDeviceId ? 3 * 60 * 1000 : 60 * 1000;
@@ -287,19 +302,25 @@ app.post('/api/carpool/presence', async (req: AuthenticatedRequest, res: Respons
 // Endpoint: Find Real Active Commuters Nearby (Different Accounts Within Range)
 app.get('/api/carpool/nearby', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const lat = Number(req.query.lat);
-    const lng = Number(req.query.lng);
     const radiusKm = Math.max(0.1, Math.min(Number(req.query.radius) || 3, 50));
     const deviceId = (req.query.deviceId as string) || '';
-
+    if (!isValidDeviceId(deviceId)) return res.status(400).json({ success: false, code: 'DEVICE_ID_INVALID', message: 'A valid device ID is required.' });
+    const { data: ownPresence, error: ownPresenceError } = await supabaseAdmin!.from('carpool_presence').select('payload')
+      .eq('device_id', deviceId).eq('user_id', req.authUserId!).gt('expires_at', new Date().toISOString()).maybeSingle();
+    if (ownPresenceError) throw ownPresenceError;
+    if (!ownPresence) return res.status(409).json({ success: false, code: 'PRESENCE_REQUIRED', message: 'Your device is not currently broadcasting.' });
+    const ownLocation = ownPresence.payload as LiveCommuterPresence;
+    const lat = Number(ownLocation?.pickupCoords?.lat);
+    const lng = Number(ownLocation?.pickupCoords?.lng);
     if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
-      return res.status(400).json({ success: false, message: 'Valid lat and lng query params are required.' });
+      return res.status(409).json({ success: false, code: 'LOCATION_INVALID', message: 'Your active location is invalid. Refresh your location.' });
+    }
+    if (ownLocation.locationSource === 'gps' && (!Number.isFinite(ownLocation.locationFixTimestamp) || Date.now() - Number(ownLocation.locationFixTimestamp) > 90_000)) {
+      return res.status(409).json({ success: false, code: 'LOCATION_STALE', message: 'Your GPS fix is stale. Refresh your location before scanning.' });
     }
 
     const now = new Date().toISOString();
-    const nearby: Array<
-      LiveCommuterPresence & { distanceFromUserKm: number; distanceFromUserMeters: number; routeMatchPercent: number }
-    > = [];
+    const nearby: Array<LiveCommuterPresence & { distanceFromUserKm: number; distanceFromUserMeters: number; distanceUncertaintyMeters: number; routeMatchPercent: number }> = [];
 
     const { data: activeRows, error } = await supabaseAdmin!.from('carpool_presence')
       .select('device_id,user_id,spawned_by_device_id,payload,last_seen_at,expires_at').gt('expires_at', now);
@@ -310,10 +331,16 @@ app.get('/api/carpool/nearby', async (req: AuthenticatedRequest, res: Response) 
       if (id === deviceId) continue;
       if (row.user_id === req.authUserId && row.spawned_by_device_id !== deviceId) continue;
       if (row.spawned_by_device_id && row.spawned_by_device_id !== deviceId) continue;
+      const coords = presence?.pickupCoords;
+      if (!coords || !Number.isFinite(coords.lat) || !Number.isFinite(coords.lng) || Math.abs(coords.lat) > 90 || Math.abs(coords.lng) > 180) continue;
+      if (presence.locationSource === 'gps' && (!Number.isFinite(presence.locationFixTimestamp) || Date.now() - Number(presence.locationFixTimestamp) > 90_000)) continue;
 
-      const distMeters = calculateDistanceMeters(lat, lng, presence.pickupCoords.lat, presence.pickupCoords.lng);
+      const distMeters = calculateDistanceMeters(lat, lng, coords.lat, coords.lng);
+      const ownAccuracy = Math.min(10_000, Math.max(0, Number(ownLocation.coordsAccuracyMeters) || (ownLocation.locationSource === 'ip' ? 5_000 : ownLocation.locationSource === 'manual' ? 250 : 0)));
+      const peerAccuracy = Math.min(10_000, Math.max(0, Number(presence.coordsAccuracyMeters) || (presence.locationSource === 'ip' ? 5_000 : presence.locationSource === 'manual' ? 250 : 0)));
+      const distanceUncertaintyMeters = Math.round(ownAccuracy + peerAccuracy);
       const distKm = Math.round(distMeters) / 1000;
-      if (distKm <= radiusKm) {
+      if (Math.max(0, distMeters - distanceUncertaintyMeters) / 1000 <= radiusKm) {
         const destDistKm = calculateDistanceKm(
           Number(req.query.destLat) || lat,
           Number(req.query.destLng) || lng,
@@ -326,6 +353,7 @@ app.get('/api/carpool/nearby', async (req: AuthenticatedRequest, res: Response) 
           ...presence,
           distanceFromUserKm: distKm,
           distanceFromUserMeters: distMeters,
+          distanceUncertaintyMeters,
           routeMatchPercent: matchPercent
         });
       }
@@ -468,16 +496,19 @@ function computeAndAcceptLinkUp(session: LiveLinkUpSession, responderEmail?: str
 app.post('/api/carpool/linkup/request', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { fromDeviceId, toDeviceId } = req.body;
-    if (!isValidDeviceId(fromDeviceId) || !isValidDeviceId(toDeviceId)) return res.status(400).json({ success: false, message: 'Valid fromDeviceId and toDeviceId are required.' });
+    if (!isValidDeviceId(fromDeviceId) || !isValidDeviceId(toDeviceId)) return res.status(400).json({ success: false, code: 'DEVICE_ID_INVALID', message: 'Valid fromDeviceId and toDeviceId are required.' });
     const now = new Date().toISOString();
-    const [{ data: sourceRow }, { data: targetRow }] = await Promise.all([
+    const [sourceResult, targetResult] = await Promise.all([
       supabaseAdmin!.from('carpool_presence').select('payload,user_id').eq('device_id', fromDeviceId).eq('user_id', req.authUserId!).gt('expires_at', now).maybeSingle(),
       supabaseAdmin!.from('carpool_presence').select('payload,user_id,spawned_by_device_id').eq('device_id', toDeviceId).gt('expires_at', now).maybeSingle()
     ]);
-    if (!sourceRow) return res.status(403).json({ success: false, message: 'Sender device is not active for this account.' });
-    if (!targetRow) return res.status(404).json({ success: false, message: 'The other commuter is no longer active on the network.' });
+    if (sourceResult.error || targetResult.error) throw sourceResult.error || targetResult.error;
+    const sourceRow = sourceResult.data;
+    const targetRow = targetResult.data;
+    if (!sourceRow) return res.status(403).json({ success: false, code: 'SENDER_PRESENCE_REQUIRED', message: 'Your device is no longer active. Refresh your radar and try again.' });
+    if (!targetRow) return res.status(404).json({ success: false, code: 'TARGET_OFFLINE', message: 'The other commuter is no longer active on the network.' });
     const isOwnedTest = targetRow.user_id === req.authUserId && targetRow.spawned_by_device_id === fromDeviceId;
-    if (targetRow.user_id === req.authUserId && !isOwnedTest) return res.status(400).json({ success: false, message: 'Cannot start a link up with your own device.' });
+    if (targetRow.user_id === req.authUserId && !isOwnedTest) return res.status(400).json({ success: false, code: 'SAME_ACCOUNT', message: 'Cannot start a link up with your own account.' });
     const fromPresence = sourceRow.payload as LiveCommuterPresence;
     const targetPresence = targetRow.payload as LiveCommuterPresence;
     const requestId = `LNK-${crypto.randomUUID()}`;
@@ -491,13 +522,20 @@ app.post('/api/carpool/linkup/request', async (req: AuthenticatedRequest, res: R
       createdAt: Date.now()
     };
     if (isOwnedTest) computeAndAcceptLinkUp(session);
-    const { error } = await supabaseAdmin!.from('carpool_linkup_sessions').insert({
-      request_id: requestId, from_user_id: req.authUserId, to_user_id: targetRow.user_id,
-      from_device_id: fromDeviceId, to_device_id: toDeviceId, status: session.status, session,
-      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    const { data: requestRows, error } = await supabaseAdmin!.rpc('create_linkup_request', {
+      p_request_id: requestId,
+      p_from_user_id: req.authUserId,
+      p_to_user_id: targetRow.user_id,
+      p_from_device_id: fromDeviceId,
+      p_to_device_id: toDeviceId,
+      p_status: session.status,
+      p_session: session,
+      p_expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString()
     });
     if (error) throw error;
-    return res.json({ success: true, message: session.status === 'accepted' ? 'Link Up accepted! Both devices are synchronized.' : 'Link Up request sent to ' + targetPresence.username, requestId, session });
+    const saved = requestRows?.[0];
+    const savedSession = (saved?.session || session) as LiveLinkUpSession;
+    return res.json({ success: true, code: saved?.created ? 'LINKUP_CREATED' : 'LINKUP_ALREADY_PENDING', message: saved?.created ? 'Link Up request sent to ' + targetPresence.username : 'A Link Up request is already waiting for this commuter.', requestId: saved?.request_id || requestId, session: savedSession, created: !!saved?.created });
   } catch (error: any) {
     console.error('Failed to initiate link up:', {
       code: error?.code,
@@ -511,20 +549,53 @@ app.post('/api/carpool/linkup/request', async (req: AuthenticatedRequest, res: R
 app.get('/api/carpool/linkup/incoming', async (req: AuthenticatedRequest, res: Response) => {
   const deviceId = req.query.deviceId as string;
   if (!isValidDeviceId(deviceId)) return res.status(400).json({ success: false, message: 'Valid deviceId is required.' });
-  const { data, error } = await supabaseAdmin!.from('carpool_linkup_sessions')
-    .select('session').eq('to_user_id', req.authUserId!).eq('to_device_id', deviceId)
-    .eq('status', 'pending').gt('expires_at', new Date().toISOString());
-  if (error) return res.status(500).json({ success: false, message: 'Could not fetch incoming requests.' });
-  return res.json({ success: true, incoming: (data || []).map((row) => row.session) });
+  const now = new Date().toISOString();
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { data: rows, error: readError } = await supabaseAdmin!.from('carpool_linkup_sessions')
+    .select('request_id,status,session,expires_at,created_at')
+    .or(`and(from_user_id.eq.${req.authUserId},from_device_id.eq.${deviceId}),and(to_user_id.eq.${req.authUserId},to_device_id.eq.${deviceId})`)
+    .gt('created_at', since).order('created_at', { ascending: false });
+  if (readError) {
+    console.error('Could not refresh Link Up requests:', { code: readError.code, message: readError.message });
+    return res.status(500).json({ success: false, message: 'Could not refresh Link Up requests.' });
+  }
+  const expiredRows = (rows || []).filter((row) => row.status === 'pending' && row.expires_at <= now);
+  const staleSessions = (rows || []).filter((row) => ['pending', 'accepted'].includes(row.status) && row.expires_at <= now);
+  for (const stale of staleSessions) {
+    const status = stale.status === 'pending' ? 'expired' : 'completed';
+    const session = { ...(stale.session as Record<string, unknown>), status };
+    const { error } = await supabaseAdmin!.from('carpool_linkup_sessions').update({ status, session })
+      .eq('request_id', stale.request_id).eq('status', stale.status).lte('expires_at', now);
+    if (error) console.error('Could not terminalize expired Link Up session:', { code: error.code, message: error.message });
+    stale.status = status;
+    stale.session = session;
+  }
+  const recentRows = (rows || []).filter((row) => new Date(row.created_at).getTime() > Date.now() - 10 * 60 * 1000 && (row.expires_at > now || ['expired', 'cancelled', 'declined', 'completed'].includes(row.status)));
+  const incoming = recentRows.filter((row) => row.session?.toDeviceId === deviceId && row.status === 'pending');
+  const handled = recentRows.filter((row) =>
+    (row.session?.toDeviceId === deviceId && ['accepted', 'declined'].includes(row.status)) ||
+    ['cancelled', 'completed'].includes(row.status)
+  );
+  const active = recentRows.find((row) => row.status === 'accepted');
+  const outgoing = recentRows.find((row) => row.session?.fromDeviceId === deviceId && row.status === 'pending');
+  return res.json({
+    success: true,
+    incoming: incoming.map((row) => row.session),
+    handled: handled.map((row) => row.session),
+    active: active?.session || null,
+    outgoing: outgoing?.session || null,
+    expired: (expiredRows || []).map((row) => ({ ...(row.session as Record<string, unknown>), status: 'expired' }))
+  });
 });
 
 app.post('/api/carpool/linkup/respond', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { requestId, action, deviceId } = req.body;
     if (typeof requestId !== 'string' || !isValidDeviceId(deviceId) || !['accepted', 'declined'].includes(action)) return res.status(400).json({ success: false, message: 'Valid requestId, deviceId, and action are required.' });
-    const { data: row } = await supabaseAdmin!.from('carpool_linkup_sessions').select('*')
+    const { data: row, error: lookupError } = await supabaseAdmin!.from('carpool_linkup_sessions').select('*')
       .eq('request_id', requestId).eq('to_user_id', req.authUserId!).eq('to_device_id', deviceId)
       .eq('status', 'pending').gt('expires_at', new Date().toISOString()).maybeSingle();
+    if (lookupError) throw lookupError;
     if (!row) return res.status(404).json({ success: false, message: 'Request expired or not found.' });
     const session = row.session as LiveLinkUpSession;
     session.status = action;
@@ -541,29 +612,41 @@ app.post('/api/carpool/linkup/respond', async (req: AuthenticatedRequest, res: R
 });
 
 app.get('/api/carpool/linkup/session/:requestId', async (req: AuthenticatedRequest, res: Response) => {
-  const { data, error } = await supabaseAdmin!.from('carpool_linkup_sessions').select('session')
+  const { data, error } = await supabaseAdmin!.from('carpool_linkup_sessions').select('request_id,status,session,expires_at')
     .eq('request_id', req.params.requestId).or(`from_user_id.eq.${req.authUserId},to_user_id.eq.${req.authUserId}`)
-    .gt('expires_at', new Date().toISOString()).maybeSingle();
+    .maybeSingle();
   if (error || !data) return res.status(404).json({ success: false, message: 'Session not found.' });
-  return res.json({ success: true, session: data.session });
+  let status = data.status;
+  let session = data.session as LiveLinkUpSession;
+  if (['pending', 'accepted'].includes(status) && new Date(data.expires_at).getTime() <= Date.now()) {
+    status = status === 'pending' ? 'expired' : 'completed';
+    session = { ...session, status };
+    const { error: expiryError } = await supabaseAdmin!.from('carpool_linkup_sessions')
+      .update({ status, session }).eq('request_id', data.request_id).eq('status', data.status).lte('expires_at', new Date().toISOString());
+    if (expiryError) console.error('Could not persist expired link up:', { code: expiryError.code, message: expiryError.message });
+  }
+  return res.json({ success: true, session: { ...session, status } });
 });
 // Endpoint: Cancel an Accepted / Confirmed Link Up Session
 app.post('/api/carpool/linkup/cancel', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { requestId, cancelledByDeviceId } = req.body || {};
     if (typeof requestId !== 'string' || !isValidDeviceId(cancelledByDeviceId)) return res.status(400).json({ success: false, message: 'requestId and a valid cancelledByDeviceId are required.' });
-    const { data: row } = await supabaseAdmin!.from('carpool_linkup_sessions').select('*')
+    const { data: row, error: lookupError } = await supabaseAdmin!.from('carpool_linkup_sessions').select('*')
       .eq('request_id', requestId).or(`from_user_id.eq.${req.authUserId},to_user_id.eq.${req.authUserId}`)
-      .gt('expires_at', new Date().toISOString()).maybeSingle();
+      .in('status', ['pending', 'accepted']).gt('expires_at', new Date().toISOString()).maybeSingle();
+    if (lookupError) throw lookupError;
     if (!row) return res.status(404).json({ success: false, message: 'Session not found.' });
     const ownsFrom = row.from_user_id === req.authUserId && row.from_device_id === cancelledByDeviceId;
     const ownsTo = row.to_user_id === req.authUserId && row.to_device_id === cancelledByDeviceId;
     if (!ownsFrom && !ownsTo) return res.status(403).json({ success: false, message: 'Device does not belong to this session.' });
+    if (row.status === 'pending' && !ownsFrom) return res.status(403).json({ success: false, code: 'LINKUP_TRANSITION_FORBIDDEN', message: 'Only the sender can cancel a pending request.' });
     const session = row.session as LiveLinkUpSession;
     session.status = 'cancelled'; session.cancelledAt = Date.now(); session.cancelledBy = req.authUsername || 'Partner';
-    const { error } = await supabaseAdmin!.from('carpool_linkup_sessions').update({ status: 'cancelled', session })
-      .eq('request_id', requestId).eq('from_user_id', row.from_user_id).eq('to_user_id', row.to_user_id);
+    const { data: cancelled, error } = await supabaseAdmin!.from('carpool_linkup_sessions').update({ status: 'cancelled', session })
+      .eq('request_id', requestId).eq('from_user_id', row.from_user_id).eq('to_user_id', row.to_user_id).eq('status', row.status).gt('expires_at', new Date().toISOString()).select('request_id');
     if (error) throw error;
+    if (!cancelled?.length) return res.status(409).json({ success: false, code: 'LINKUP_STATE_CONFLICT', message: 'This Link Up is no longer active.' });
     return res.json({ success: true, requestId });
   } catch (error) {
     console.error('Failed to cancel link up:', error);

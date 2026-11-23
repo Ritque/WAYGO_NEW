@@ -251,7 +251,8 @@ export function extractRealtimePeerStatuses(
   myEmail: string,
   myLat: number,
   myLng: number,
-  radiusKm = DETECTION_RADIUS_KM
+  radiusKm = DETECTION_RADIUS_KM,
+  ownAccuracyMeters = 0
 ): RealtimePeerScanResult {
   const cleanMyEmail = (myEmail || '').trim().toLowerCase();
   const candidatesByDevice = new Map<string, any>();
@@ -263,6 +264,8 @@ export function extractRealtimePeerStatuses(
     const latest = presences[presences.length - 1];
     const peerDeviceId = latest?.deviceId || key;
     if (!peerDeviceId || peerDeviceId === myDeviceId) continue;
+    if (!Number.isFinite(latest?.lastSeenAt) || now - latest.lastSeenAt > 60_000) continue;
+    if (latest?.locationSource === 'gps' && (!Number.isFinite(latest.locationFixTimestamp) || now - latest.locationFixTimestamp > 90_000)) continue;
     candidatesByDevice.set(peerDeviceId, latest);
   }
 
@@ -291,10 +294,13 @@ export function extractRealtimePeerStatuses(
     }
 
     const coords = peer?.pickupCoords;
-    if (!coords || typeof coords.lat !== 'number' || typeof coords.lng !== 'number') continue;
+    if (!coords || typeof coords.lat !== 'number' || typeof coords.lng !== 'number' || !Number.isFinite(coords.lat) || !Number.isFinite(coords.lng) || Math.abs(coords.lat) > 90 || Math.abs(coords.lng) > 180) continue;
+    if (peer?.locationSource === 'gps' && (!Number.isFinite(peer.locationFixTimestamp) || now - peer.locationFixTimestamp > 90_000)) continue;
 
     const distMeters = calcDistanceMeters(myLat, myLng, coords.lat, coords.lng);
     const distKm = Math.round(distMeters) / 1000;
+    const peerAccuracy = Number.isFinite(peer?.coordsAccuracyMeters) ? peer.coordsAccuracyMeters : peer?.locationSource === 'ip' ? 5000 : peer?.locationSource === 'manual' ? 250 : 0;
+    const distanceUncertaintyMeters = Math.round(Math.max(0, ownAccuracyMeters) + peerAccuracy);
     const dropCoords = peer?.dropCoords || FIXED_DEST_COORDS;
 
     const commuter: RealCommuter = {
@@ -310,6 +316,7 @@ export function extractRealtimePeerStatuses(
       vehiclePreference: peer.vehiclePreference || 'cab',
       distanceFromUserKm: distKm,
       distanceFromUserMeters: distMeters,
+      distanceUncertaintyMeters,
       coordsAccuracyMeters:
         typeof peer.coordsAccuracyMeters === 'number' ? Math.round(peer.coordsAccuracyMeters) : null,
       locationSource: peer.locationSource || undefined,
@@ -322,7 +329,7 @@ export function extractRealtimePeerStatuses(
       )
     };
 
-    if (distKm <= radiusKm) {
+    if (Math.max(0, distMeters - distanceUncertaintyMeters) / 1000 <= radiusKm) {
       withinRange.push(commuter);
     } else {
       outOfRange.push(commuter);

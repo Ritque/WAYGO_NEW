@@ -6,6 +6,7 @@ import {
   calcDistanceMeters,
   formatPreciseDistance
 } from '../utils/carpoolRealtime';
+import { LocationStatus } from '../utils/locationManager';
 import { 
   Radar, 
   UserCheck, 
@@ -34,6 +35,8 @@ interface CarpoolScannerModalProps {
   gpsAccuracyMeters?: number | null;
   calibratingGps?: boolean;
   locationSource: LocationSource;
+  locationStatus?: LocationStatus;
+  locationFixTimestamp?: number | null;
   locationError?: 'blocked' | 'unavailable' | null;
   onSetCustomLocation: (lat: number, lng: number, label: string) => void;
   locatingUser: boolean;
@@ -48,6 +51,7 @@ interface CarpoolScannerModalProps {
   activeSession: any | null;
   onSetActiveSession: (session: any | null) => void;
   onCancelLinkUp?: () => void | Promise<void>;
+  onCancelPendingLinkUp?: () => void | Promise<void>;
   linkupNotice?: string | null;
   onDismissLinkupNotice?: () => void;
   pendingSentRequestId: string | null;
@@ -67,6 +71,8 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
   gpsAccuracyMeters = null,
   calibratingGps = false,
   locationSource,
+  locationStatus = 'unavailable',
+  locationFixTimestamp = null,
   locationError = null,
   onSetCustomLocation,
   locatingUser,
@@ -81,6 +87,7 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
   activeSession,
   onSetActiveSession,
   onCancelLinkUp,
+  onCancelPendingLinkUp,
   linkupNotice = null,
   onDismissLinkupNotice,
   pendingSentRequestId,
@@ -100,6 +107,7 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
   const [searchingArea, setSearchingArea] = useState(false);
   const [localTestSeekers, setLocalTestSeekers] = useState<RealCommuter[]>([]);
   const [requestingSeekerId, setRequestingSeekerId] = useState<string | null>(null);
+  const requestLockRef = React.useRef(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const [bookingDialog, setBookingDialog] = useState<{
     provider: 'uber' | 'ola' | 'rapido';
@@ -215,6 +223,8 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
 
   // Send real Link Up request to another real device (via both Express + Supabase Realtime Broadcast)
   const handleSendLinkUp = async (seeker: RealCommuter) => {
+    if (requestLockRef.current || pendingSentRequestId) return;
+    requestLockRef.current = true;
     setRequestingSeekerId(seeker.deviceId);
     const isSimulatedTest =
       seeker.deviceId.startsWith('dev_real_user_') || seeker.deviceId.startsWith('test_');
@@ -256,7 +266,7 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
         return;
       }
       if (data && data.success && data.requestId) {
-        if (!isSimulatedTest && data.session) {
+        if (!isSimulatedTest && data.created && data.session) {
           await onBroadcastLinkUpRequest(data.session);
         }
         onSetPendingSentRequestId(data.requestId);
@@ -266,6 +276,8 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
     } catch (error: any) {
       setRequestingSeekerId(null);
       alert(error?.message || 'Could not create a link up request. Please try again.');
+    } finally {
+      requestLockRef.current = false;
     }
   };
 
@@ -309,6 +321,8 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
       distanceFromUserMeters: spawnedDistMeters,
       coordsAccuracyMeters: 4,
       locationSource: 'gps',
+          locationStatus: 'active',
+          locationFixTimestamp: Date.now(),
       routeMatchPercent: 96
     };
 
@@ -353,7 +367,11 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
           pickupCoords: senderCoords,
           dropCoords: FIXED_DEST_COORDS,
           departTime: 'Leaving now',
-          vehiclePreference: 'cab'
+          vehiclePreference: 'cab',
+          coordsAccuracyMeters: 8,
+          locationSource: 'gps',
+          locationStatus: 'active',
+          locationFixTimestamp: Date.now()
         })
       });
 
@@ -523,6 +541,17 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
           </div>
         )}
 
+        {pendingSentRequestId && !activeSession && (
+          <div className="mb-4 p-3 rounded-2xl bg-cyan-500/10 border border-cyan-400/30 text-cyan-100 text-xs flex items-center justify-between gap-3">
+            <span>Waiting for the other commuter to respond. This request expires automatically.</span>
+            {onCancelPendingLinkUp && (
+              <button type="button" onClick={onCancelPendingLinkUp} className="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-white font-semibold cursor-pointer">
+                Cancel request
+              </button>
+            )}
+          </div>
+        )}
+
         {/* BANNER: INCOMING REAL LINK UP REQUEST */}
         {incomingRequest && !activeSession && (
           <div className="p-4 sm:p-5 rounded-2xl bg-gradient-to-r from-emerald-500/25 via-teal-500/20 to-cyan-500/25 border-2 border-emerald-400 shadow-xl mb-6">
@@ -672,6 +701,10 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
                   </button>
                 </div>
               </div>
+              <div className="text-[10px] text-white/45">
+                Location status: {locationStatus.replace('_', ' ')}
+                {locationFixTimestamp ? ` · Updated ${Math.max(0, Math.floor((Date.now() - locationFixTimestamp) / 1000))}s ago` : ''}
+              </div>
 
               {showAreaSearch && (
                 <div className="pt-2 border-t border-white/10 space-y-2">
@@ -726,8 +759,14 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
                   <div>
                     ⚠️{' '}
                     {locationError === 'blocked'
-                      ? 'Browser/iframe blocked GPS access. Approximate network coordinates may differ by >3 km from your other device.'
-                      : 'Using approximate location rather than Live GPS — devices nearby may show >3 km apart until both share exact GPS or matching area.'}
+                      ? 'Browser or device permission blocked GPS. Any network fallback is approximate; if none is available, WayGo will not broadcast a location.'
+                      : locationStatus === 'unavailable'
+                      ? 'GPS is unavailable. Retry location or choose a network estimate or manual area; no live GPS position is being broadcast.'
+                      : locationSource === 'ip'
+                      ? 'Using approximate network location rather than Live GPS — distances can vary by several kilometres.'
+                      : locationSource === 'manual'
+                      ? 'Using your manually selected area. Distances are approximate until GPS is available.'
+                      : 'Waiting for a confirmed location. Your default map position is not being broadcast.'}
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <a
@@ -971,6 +1010,9 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
                               <Navigation className="w-3 h-3" />{' '}
                               {formatPreciseDistance(seeker.distanceFromUserMeters, seeker.distanceFromUserKm)} away
                             </span>
+                            {seeker.distanceUncertaintyMeters != null && seeker.distanceUncertaintyMeters > 0 && (
+                              <span className="text-[10px] text-amber-300">approx. ±{seeker.distanceUncertaintyMeters} m</span>
+                            )}
                             {seeker.coordsAccuracyMeters != null && seeker.locationSource === 'gps' ? (
                               <span
                                 className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold border ${
@@ -1013,11 +1055,11 @@ export const CarpoolScannerModal: React.FC<CarpoolScannerModalProps> = ({
                       <div className="sm:self-center shrink-0">
                         <button
                           type="button"
-                          disabled={isPending}
+                          disabled={isPending || isRequesting || Boolean(pendingSentRequestId)}
                           onClick={() => handleSendLinkUp(seeker)}
                           className="w-full sm:w-auto px-5 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-xs shadow-lg shadow-emerald-500/25 transition transform hover:-translate-y-0.5 disabled:opacity-50 cursor-pointer flex items-center justify-center gap-2"
                         >
-                          {isPending ? (
+                          {isPending || isRequesting ? (
                             <>
                               <RefreshCw className="w-4 h-4 animate-spin" />
                               <span>Waiting for Acceptance...</span>

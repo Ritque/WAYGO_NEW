@@ -23,6 +23,7 @@ import { DailyQuote } from './components/DailyQuote';
 import { isSupabaseConfigured, supabase } from './supabaseClient';
 import { getUserData, setUserData, deleteUserData } from './userData';
 import { carpoolFetch } from './utils/carpoolApi';
+import { BrowserLocationManager, LocationStatus } from './utils/locationManager';
 import {
   FIXED_DEST_NAME,
   FIXED_DEST_COORDS,
@@ -90,6 +91,8 @@ export default function App() {
   const [gpsAccuracyMeters, setGpsAccuracyMeters] = useState<number | null>(null);
   const [locationSource, setLocationSource] = useState<LocationSource>('default');
   const [locationError, setLocationError] = useState<'blocked' | 'unavailable' | null>(null);
+  const [locationStatus, setLocationStatus] = useState<LocationStatus>('acquiring');
+  const [locationFixTimestamp, setLocationFixTimestamp] = useState<number | null>(null);
   const [nearbyCommuters, setNearbyCommuters] = useState<RealCommuter[]>([]);
   const [outOfRangeCommuters, setOutOfRangeCommuters] = useState<RealCommuter[]>([]);
   const [incomingLinkUp, setIncomingLinkUp] = useState<any | null>(null);
@@ -110,13 +113,23 @@ export default function App() {
   const acceptedLinkUpRef = useRef<any | null>(acceptedLinkUpSession);
   const currentUserRef = useRef(currentUser);
   const locationSourceRef = useRef<LocationSource>(locationSource);
+  const locationStatusRef = useRef<LocationStatus>(locationStatus);
+  const locationManagerRef = useRef<BrowserLocationManager | null>(null);
   const gpsAccuracyRef = useRef<number | null>(gpsAccuracyMeters);
-  const calibrationCleanupRef = useRef<(() => void) | null>(null);
+  const locationFixTimestampRef = useRef<number | null>(locationFixTimestamp);
   const linkupNoticeTimerRef = useRef<any>(null);
   const carpoolScannerOpenRef = useRef(carpoolScannerOpen);
   const realtimeChannelRef = useRef<any>(null);
   const rtSubscribedRef = useRef(false);
   const lastTrackedSignatureRef = useRef('');
+  const presencePublishedRef = useRef(false);
+  const presenceWriteInFlightRef = useRef(false);
+  const nearbyFetchInFlightRef = useRef(false);
+  const incomingPollInFlightRef = useRef(false);
+  const pendingSessionPollInFlightRef = useRef(false);
+  const activeSessionPollInFlightRef = useRef(false);
+  const seenExpiredRequestsRef = useRef<Set<string>>(new Set());
+  const seenHandledRequestsRef = useRef<Set<string>>(new Set());
   const serverCommutersRef = useRef<RealCommuter[]>([]);
   const realtimeCommutersRef = useRef<RealCommuter[]>([]);
   const broadcastPeersRef = useRef<Map<string, any>>(new Map());
@@ -166,12 +179,20 @@ export default function App() {
   }, [locationSource]);
 
   useEffect(() => {
+    locationStatusRef.current = locationStatus;
+  }, [locationStatus]);
+
+  useEffect(() => {
     gpsAccuracyRef.current = gpsAccuracyMeters;
   }, [gpsAccuracyMeters]);
 
-  // Fresh per-page-load device ID so every refresh starts clean without saved test commuters
   useEffect(() => {
-    const id = 'dev_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+    locationFixTimestampRef.current = locationFixTimestamp;
+  }, [locationFixTimestamp]);
+
+  // Stable per-tab device ID lets an in-flight Link Up session recover after a page reload.
+  useEffect(() => {
+    const id = sessionStorage.getItem('waygo_session_device_id') || ('dev_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36));
     sessionStorage.setItem('waygo_session_device_id', id);
     setDeviceId(id);
   }, []);
@@ -299,7 +320,8 @@ export default function App() {
       email,
       lat,
       lng,
-      DETECTION_RADIUS_KM
+      DETECTION_RADIUS_KM,
+      gpsAccuracyRef.current || (locationSourceRef.current === 'ip' ? 5000 : 0)
     );
     realtimeCommutersRef.current = withinRange;
     setOutOfRangeCommuters(outOfRange);
@@ -323,249 +345,79 @@ export default function App() {
     setLivePickupLocation(`${prefix} (${lat.toFixed(4)}, ${lng.toFixed(4)})`);
   }, []);
 
-  // IP Geolocation fallback when browser GPS is denied, blocked by iframe, or unavailable
   const fallbackToIpLocation = useCallback(async () => {
-    const applyIp = (lat: number, lng: number, label: string) => {
-      setLivePickupCoords({ lat, lng });
-      setGpsAccuracyMeters(null);
-      setLocationSource('ip');
-      setLivePickupLocation(label || `Network Location (${lat.toFixed(4)}, ${lng.toFixed(4)})`);
-    };
-
-    try {
-      const res = await fetch('https://ipwho.is/');
-      const data = await safeJson(res);
-      if (data && data.success !== false && typeof data.latitude === 'number' && typeof data.longitude === 'number') {
-        const label = [data.city, data.region].filter(Boolean).join(', ');
-        applyIp(data.latitude, data.longitude, label ? `${label} (Approx Network)` : '');
-        return;
+    const providers = [
+      async () => {
+        const response = await fetch('https://ipwho.is/');
+        const data = await safeJson(response);
+        if (!data || data.success === false) return null;
+        return { lat: Number(data.latitude), lng: Number(data.longitude), label: [data.city, data.region].filter(Boolean).join(', ') };
+      },
+      async () => {
+        const response = await fetch('https://get.geojs.io/v1/ip/geo.json');
+        const data = await safeJson(response);
+        return { lat: Number(data?.latitude), lng: Number(data?.longitude), label: [data?.city, data?.region].filter(Boolean).join(', ') };
+      },
+      async () => {
+        const response = await fetch('https://ipapi.co/json/');
+        const data = await safeJson(response);
+        return { lat: Number(data?.latitude), lng: Number(data?.longitude), label: [data?.city, data?.region].filter(Boolean).join(', ') };
       }
-    } catch {
-      // try next provider
-    }
-
-    try {
-      const res2 = await fetch('https://get.geojs.io/v1/ip/geo.json');
-      const data2 = await safeJson(res2);
-      const lat = Number(data2?.latitude);
-      const lng = Number(data2?.longitude);
-      if (!isNaN(lat) && !isNaN(lng) && (lat !== 0 || lng !== 0)) {
-        const label = [data2.city, data2.region].filter(Boolean).join(', ');
-        applyIp(lat, lng, label ? `${label} (Approx Network)` : '');
+    ];
+    for (const provider of providers) {
+      try {
+        const point = await provider();
+        if (!point || !Number.isFinite(point.lat) || !Number.isFinite(point.lng) || Math.abs(point.lat) > 90 || Math.abs(point.lng) > 180) continue;
+        setLivePickupCoords({ lat: point.lat, lng: point.lng });
+        setGpsAccuracyMeters(null);
+        setLocationSource('ip');
+        setLocationFixTimestamp(Date.now());
+        setLocationStatus('degraded');
+        setLivePickupLocation(`${point.label || 'Network location'} (Approximate)`);
         return;
+      } catch {
+        // Try the next approximate network location provider.
       }
-    } catch {
-      // try next provider
     }
-
-    try {
-      const res3 = await fetch('https://ipapi.co/json/');
-      const data3 = await safeJson(res3);
-      if (data3 && typeof data3.latitude === 'number' && typeof data3.longitude === 'number') {
-        const label = [data3.city, data3.region].filter(Boolean).join(', ');
-        applyIp(data3.latitude, data3.longitude, label ? `${label} (Approx Network)` : '');
-        return;
-      }
-    } catch {
-      // ignore
-    }
-
-    setLocationSource((prev) => (prev === 'manual' || prev === 'gps' ? prev : 'default'));
-    setLivePickupLocation((prev) =>
-      prev === 'Detecting your location...' ? 'Vanaz Metro Station, Paud Road, Kothrud, Pune' : prev
-    );
+    setLocationSource('default');
+    setGpsAccuracyMeters(null);
+    setLocationFixTimestamp(null);
+    setLocationStatus('unavailable');
+    setLocationError(locationStatusRef.current === 'permission_denied' ? 'blocked' : 'unavailable');
+    setLivePickupLocation('Location unavailable — set an area manually');
   }, []);
 
-  // Two-tier browser geolocation + optional 4s multi-sample inverse-variance GNSS calibration
-  const locateUserPosition = useCallback(
-    (highPrecisionCalibration = false) => {
-      if (calibrationCleanupRef.current) {
-        calibrationCleanupRef.current();
-        calibrationCleanupRef.current = null;
-      }
-
-      if (!navigator.geolocation) {
-        setLocationError('unavailable');
-        fallbackToIpLocation();
-        return;
-      }
-
-      setLocatingUser(true);
-
-      const onGeoSuccess = async (pos: GeolocationPosition) => {
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        const acc = typeof pos.coords.accuracy === 'number' ? Math.round(pos.coords.accuracy) : null;
-        setLivePickupCoords({ lat, lng });
-        setGpsAccuracyMeters(acc);
-        setLocationSource('gps');
-        setLocationError(null);
-        await reverseGeocodeCoords(lat, lng, 'Live GPS');
-        setLocatingUser(false);
-        setCalibratingGps(false);
-      };
-
-      const runSingleShotFallback = () => {
-        navigator.geolocation.getCurrentPosition(
-          onGeoSuccess,
-          (err) => {
-            if (err && err.code === 1) {
-              setLocatingUser(false);
-              setCalibratingGps(false);
-              setLocationError('blocked');
-              if (locationSourceRef.current !== 'manual') {
-                fallbackToIpLocation();
-              }
-              return;
-            }
-            navigator.geolocation.getCurrentPosition(
-              onGeoSuccess,
-              () => {
-                setLocatingUser(false);
-                setCalibratingGps(false);
-                setLocationError('unavailable');
-                if (locationSourceRef.current !== 'manual') {
-                  fallbackToIpLocation();
-                }
-              },
-              { enableHighAccuracy: false, timeout: 8000, maximumAge: 15000 }
-            );
-          },
-          { enableHighAccuracy: true, timeout: 6500, maximumAge: 0 }
-        );
-      };
-
-      if (!highPrecisionCalibration) {
-        runSingleShotFallback();
-        return;
-      }
-
-      setCalibratingGps(true);
-      const samples: Array<{ lat: number; lng: number; acc: number }> = [];
-      let finished = false;
-      let watchId: number | null = null;
-      let timer: any = null;
-
-      const cleanup = () => {
-        if (watchId !== null && navigator.geolocation) {
-          navigator.geolocation.clearWatch(watchId);
-          watchId = null;
-        }
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
-        }
-      };
-
-      calibrationCleanupRef.current = () => {
-        finished = true;
-        cleanup();
-        setCalibratingGps(false);
-        setLocatingUser(false);
-      };
-
-      const finalizeSamples = async () => {
-        if (finished) return;
-        finished = true;
-        cleanup();
-        calibrationCleanupRef.current = null;
-
-        if (samples.length === 0) {
-          runSingleShotFallback();
-          return;
-        }
-
-        const tightSamples = samples.filter((s) => s.acc <= 60);
-        let finalLat: number;
-        let finalLng: number;
-        let finalAcc: number;
-
-        if (tightSamples.length > 0) {
-          let sumW = 0;
-          let sumLatW = 0;
-          let sumLngW = 0;
-          for (const s of tightSamples) {
-            const w = 1 / Math.max(4, s.acc * s.acc);
-            sumW += w;
-            sumLatW += s.lat * w;
-            sumLngW += s.lng * w;
-          }
-          finalLat = sumLatW / sumW;
-          finalLng = sumLngW / sumW;
-          finalAcc = Math.max(1, Math.round(Math.sqrt(1 / sumW)));
-        } else {
-          const best = samples.reduce((prev, cur) => (cur.acc < prev.acc ? cur : prev), samples[0]);
-          finalLat = best.lat;
-          finalLng = best.lng;
-          finalAcc = Math.round(best.acc);
-        }
-
-        setLivePickupCoords({ lat: finalLat, lng: finalLng });
-        setGpsAccuracyMeters(finalAcc);
-        setLocationSource('gps');
-        setLocationError(null);
-        await reverseGeocodeCoords(finalLat, finalLng, 'Live GPS');
-        setCalibratingGps(false);
-        setLocatingUser(false);
-      };
-
-      timer = setTimeout(() => {
-        finalizeSamples();
-      }, 4000);
-
-      watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          if (finished) return;
-          const acc = typeof pos.coords.accuracy === 'number' && pos.coords.accuracy > 0 ? pos.coords.accuracy : 50;
-          samples.push({ lat: pos.coords.latitude, lng: pos.coords.longitude, acc });
-          const tightCount = samples.filter((s) => s.acc <= 12).length;
-          if (tightCount >= 3) {
-            finalizeSamples();
-          }
-        },
-        (err) => {
-          if (finished) return;
-          if (err && err.code === 1) {
-            finished = true;
-            cleanup();
-            calibrationCleanupRef.current = null;
-            setCalibratingGps(false);
-            setLocatingUser(false);
-            setLocationError('blocked');
-            if (locationSourceRef.current !== 'manual') {
-              fallbackToIpLocation();
-            }
-          } else if (samples.length > 0) {
-            finalizeSamples();
-          } else {
-            finished = true;
-            cleanup();
-            calibrationCleanupRef.current = null;
-            runSingleShotFallback();
-          }
-        },
-        { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
-      );
-    },
-    [fallbackToIpLocation, reverseGeocodeCoords]
-  );
-
+  const locateUserPosition = useCallback((highPrecisionCalibration = false) => {
+    setLocatingUser(true);
+    setCalibratingGps(highPrecisionCalibration);
+    locationManagerRef.current?.refresh();
+  }, []);
   const handleSetCustomLocation = useCallback((lat: number, lng: number, label: string) => {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      setLocationError('unavailable');
+      return;
+    }
+    locationManagerRef.current?.stop();
     setLivePickupCoords({ lat, lng });
     setGpsAccuracyMeters(null);
     setLivePickupLocation(label);
     setLocationSource('manual');
+    setLocationFixTimestamp(Date.now());
+    setLocationStatus('active');
     setLocationError(null);
   }, []);
 
   const buildMyPresencePayload = useCallback(() => {
     const user = currentUserRef.current;
     if (!deviceId || !user) return null;
+    if (locationSourceRef.current === 'default') return null;
+    if (locationSourceRef.current === 'gps' && (!locationFixTimestampRef.current || Date.now() - locationFixTimestampRef.current > 90_000)) return null;
     return {
       deviceId,
       username: user.username || 'Live Commuter',
       email: (user.email || '').trim().toLowerCase(),
-      avatar: '👤',
+      lastSeenAt: Date.now(),
+      avatar: 'ðŸ‘¤',
       pickup: livePickupRef.current,
       drop: FIXED_DEST_NAME,
       pickupCoords: liveCoordsRef.current,
@@ -573,13 +425,25 @@ export default function App() {
       departTime: 'Leaving now / 10 mins',
       vehiclePreference: 'cab' as const,
       coordsAccuracyMeters: gpsAccuracyRef.current,
-      locationSource: locationSourceRef.current
+      locationSource: locationSourceRef.current,
+      locationStatus: locationStatusRef.current,
+      locationFixTimestamp: locationFixTimestampRef.current
     };
   }, [deviceId]);
 
   const broadcastMyPresence = useCallback(async (forceRealtimeTrack = false) => {
+    if (presenceWriteInFlightRef.current) return;
     const payload = buildMyPresencePayload();
-    if (!payload) return;
+    if (!payload) {
+      if (presencePublishedRef.current) {
+        presencePublishedRef.current = false;
+        try { await realtimeChannelRef.current?.untrack(); } catch { /* channel may be reconnecting */ }
+        carpoolFetch(`/api/carpool/presence/${encodeURIComponent(deviceId)}`, { method: 'DELETE' })
+          .catch((error) => console.warn('Could not clear stale location presence:', error?.message || 'network error'));
+      }
+      return;
+    }
+    presenceWriteInFlightRef.current = true;
 
     // 1. Track on Supabase Realtime only once SUBSCRIBED and only when state changed (avoids presence churn)
     if (realtimeChannelRef.current && rtSubscribedRef.current) {
@@ -596,13 +460,17 @@ export default function App() {
 
     // 2. Express presence heartbeat
     try {
-      await carpoolFetch('/api/carpool/presence', {
+      const response = await carpoolFetch('/api/carpool/presence', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-    } catch {
-      // ignore network blips
+      if (!response.ok) throw new Error(`Presence heartbeat failed (${response.status}).`);
+      presencePublishedRef.current = true;
+    } catch (error: any) {
+      console.warn('Presence heartbeat failed:', error?.message || 'network error');
+    } finally {
+      presenceWriteInFlightRef.current = false;
     }
   }, [buildMyPresencePayload]);
 
@@ -621,19 +489,29 @@ export default function App() {
   }, [buildMyPresencePayload]);
 
   const fetchNearbyWithin3Km = useCallback(async () => {
-    if (!deviceId) return;
+    if (!deviceId || nearbyFetchInFlightRef.current) return;
+    if (locationSourceRef.current === 'default' || (locationSourceRef.current === 'gps' && (!locationFixTimestampRef.current || Date.now() - locationFixTimestampRef.current > 90_000))) {
+      serverCommutersRef.current = [];
+      realtimeCommutersRef.current = [];
+      mergeAndSetNearbyCommuters();
+      return;
+    }
+    nearbyFetchInFlightRef.current = true;
     syncRealtimePresenceState();
     try {
-      const { lat, lng } = liveCoordsRef.current;
-      const url = `/api/carpool/nearby?lat=${lat}&lng=${lng}&radius=${DETECTION_RADIUS_KM}&deviceId=${encodeURIComponent(deviceId)}&destLat=${FIXED_DEST_COORDS.lat}&destLng=${FIXED_DEST_COORDS.lng}`;
+      const url = `/api/carpool/nearby?radius=${DETECTION_RADIUS_KM}&deviceId=${encodeURIComponent(deviceId)}&destLat=${FIXED_DEST_COORDS.lat}&destLng=${FIXED_DEST_COORDS.lng}`;
       const res = await carpoolFetch(url);
       const data = await safeJson(res);
       if (data && data.success && Array.isArray(data.commuters)) {
         serverCommutersRef.current = data.commuters;
         mergeAndSetNearbyCommuters();
-      }
-    } catch {
-      // ignore
+      } else if (!res.ok) throw new Error(`Radar request failed (${res.status}).`);
+    } catch (error: any) {
+      serverCommutersRef.current = [];
+      mergeAndSetNearbyCommuters();
+      console.warn('Nearby radar refresh failed:', error?.message || 'network error');
+    } finally {
+      nearbyFetchInFlightRef.current = false;
     }
   }, [deviceId, mergeAndSetNearbyCommuters, syncRealtimePresenceState]);
 
@@ -644,17 +522,52 @@ export default function App() {
   }, [broadcastMyPresence, broadcastScannerPing, fetchNearbyWithin3Km]);
 
   const checkIncomingLinkUps = useCallback(async () => {
-    if (!deviceId) return;
+    if (!deviceId || incomingPollInFlightRef.current) return;
+    incomingPollInFlightRef.current = true;
     try {
       const res = await carpoolFetch(`/api/carpool/linkup/incoming?deviceId=${encodeURIComponent(deviceId)}`);
       const data = await safeJson(res);
-      if (data && data.success && Array.isArray(data.incoming) && data.incoming.length > 0) {
-        setIncomingLinkUp(data.incoming[0]);
-      } else {
-        setIncomingLinkUp((prev: any) => (prev && prev.viaRealtime ? prev : null));
+      if (!res.ok || !data?.success) throw new Error(data?.message || `Incoming request check failed (${res.status}).`);
+      const expired = Array.isArray(data.expired) ? data.expired.find((request: any) => request?.id && !seenExpiredRequestsRef.current.has(request.id)) : null;
+      if (expired) {
+        seenExpiredRequestsRef.current.add(expired.id);
+        showLinkupNotice('A Link Up request expired before you could respond.');
       }
-    } catch {
-      // ignore
+      if (data.active && !acceptedLinkUpRef.current) {
+        setAcceptedLinkUpSession(data.active);
+        setCarpoolScannerOpen(true);
+      }
+      if (data.outgoing?.id && !pendingSentRef.current) setPendingSentRequestId(data.outgoing.id);
+      const handled = Array.isArray(data.handled) ? data.handled : [];
+      const accepted = handled.find((session: any) => session?.status === 'accepted');
+      if (accepted && !acceptedLinkUpRef.current) {
+        setAcceptedLinkUpSession(accepted);
+        setCarpoolScannerOpen(true);
+      }
+      const declined = handled.find((session: any) => session?.status === 'declined' && !seenHandledRequestsRef.current.has(`${session.id}:declined`));
+      if (declined) {
+        seenHandledRequestsRef.current.add(`${declined.id}:declined`);
+        showLinkupNotice(`${declined.fromUser?.username || 'The sender'} declined the Link Up request.`);
+      }
+      const cancelled = handled.find((session: any) => session?.status === 'cancelled' && !seenHandledRequestsRef.current.has(`${session.id}:cancelled`));
+      if (cancelled) {
+        seenHandledRequestsRef.current.add(`${cancelled.id}:cancelled`);
+        showLinkupNotice(`${cancelled.cancelledBy || 'The other commuter'} cancelled the Link Up request.`);
+      }
+      const completed = handled.find((session: any) => session?.status === 'completed' && !seenHandledRequestsRef.current.has(`${session.id}:completed`));
+      if (completed) {
+        seenHandledRequestsRef.current.add(`${completed.id}:completed`);
+        showLinkupNotice('The Link Up session has ended.');
+      }
+      if (data && data.success && Array.isArray(data.incoming) && data.incoming.length > 0) {
+        setIncomingLinkUp((previous: any) => previous?.id === data.incoming[0].id ? previous : data.incoming[0]);
+      } else {
+        setIncomingLinkUp(null);
+      }
+    } catch (error: any) {
+      console.warn('Incoming Link Up refresh failed:', error?.message || 'network error');
+    } finally {
+      incomingPollInFlightRef.current = false;
     }
   }, [deviceId]);
 
@@ -1156,6 +1069,11 @@ export default function App() {
         showLinkupNotice(`${payload.cancelledByUsername || 'Your partner'} cancelled the link up session.`);
       }
 
+      if (payload.requestId && pendingSentRef.current === payload.requestId) {
+        setPendingSentRequestId(null);
+        showLinkupNotice(`${payload.cancelledByUsername || 'The sender'} cancelled the Link Up request.`);
+      }
+
       setIncomingLinkUp((prev: any) =>
         prev && payload.requestId && prev.id === payload.requestId ? null : prev
       );
@@ -1170,57 +1088,33 @@ export default function App() {
     }
 
     let disposed = false;
-    locateUserPosition();
-
-    // Watch high-accuracy GPS updates in real time with accuracy guard (unless manually overridden)
-    let watchId: number | null = null;
-    let fallbackWatchId: number | null = null;
-    const handleWatchPos = (pos: GeolocationPosition) => {
-      if (disposed || locationSourceRef.current === 'manual') return;
-      const newLat = pos.coords.latitude;
-      const newLng = pos.coords.longitude;
-      const newAcc = typeof pos.coords.accuracy === 'number' ? Math.round(pos.coords.accuracy) : null;
-      const curAcc = gpsAccuracyRef.current;
-      const movedMeters = calcDistanceMeters(
-        liveCoordsRef.current.lat,
-        liveCoordsRef.current.lng,
-        newLat,
-        newLng
-      );
-
-      const shouldAccept =
-        locationSourceRef.current !== 'gps' ||
-        curAcc === null ||
-        newAcc === null ||
-        newAcc <= Math.max(25, curAcc * 1.25) ||
-        movedMeters > Math.max(20, newAcc);
-
-      if (!shouldAccept) return;
-
-      setLivePickupCoords({ lat: newLat, lng: newLng });
-      setGpsAccuracyMeters(newAcc);
-      setLocationSource('gps');
-      setLocationError(null);
-      if (movedMeters >= 75) {
-        reverseGeocodeCoords(newLat, newLng, 'Live GPS');
+    if (!locationManagerRef.current) locationManagerRef.current = new BrowserLocationManager();
+    const unsubscribeLocation = locationManagerRef.current.subscribe((state) => {
+      setLocationStatus(state.status);
+      setLocationError(state.status === 'permission_denied' ? 'blocked' : state.status === 'unavailable' ? 'unavailable' : null);
+      if ((state.status === 'permission_denied' || state.status === 'unavailable') && locationSourceRef.current !== 'manual') {
+        setLocatingUser(false);
+        setCalibratingGps(false);
+        setLocationSource('default');
+        setGpsAccuracyMeters(null);
+        setLocationFixTimestamp(null);
+        fallbackToIpLocation();
+      } else if (state.fix) {
+        setLivePickupCoords({ lat: state.fix.lat, lng: state.fix.lng });
+        setGpsAccuracyMeters(state.fix.accuracy);
+        setLocationSource('gps');
+        setLocationFixTimestamp(state.fix.timestamp);
+        setLocationError(null);
+        setLocatingUser(false);
+        setCalibratingGps(false);
+        reverseGeocodeCoords(state.fix.lat, state.fix.lng, 'Live GPS');
+      } else if (state.status === 'acquiring' && locationSourceRef.current === 'gps' && (!locationFixTimestampRef.current || Date.now() - locationFixTimestampRef.current > 90_000)) {
+        setLocationSource('default');
+        setGpsAccuracyMeters(null);
+        setLocationFixTimestamp(null);
       }
-    };
-
-    if (navigator.geolocation) {
-      watchId = navigator.geolocation.watchPosition(
-        handleWatchPos,
-        (err) => {
-          if (disposed || (err && err.code === 1) || fallbackWatchId !== null) return;
-          fallbackWatchId = navigator.geolocation.watchPosition(
-            handleWatchPos,
-            () => {},
-            { enableHighAccuracy: false, maximumAge: 15000, timeout: 15000 }
-          );
-        },
-        { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
-      );
-    }
-
+    });
+    locationManagerRef.current.start();
     // 1. Ensure clean channel before connecting to global Supabase Realtime channel
     const existingChannels = supabase
       .getChannels()
@@ -1330,11 +1224,11 @@ export default function App() {
     fetchNearbyWithin3Km();
     checkIncomingLinkUps();
 
-    // 4. Heartbeat & fallback poll every 2.5s
+    // Five-second radar/recovery poll; refresh presence every third tick.
     let tickCount = 0;
     const heartbeatTimer = setInterval(() => {
       tickCount++;
-      broadcastMyPresence();
+      if (tickCount % 3 === 0) broadcastMyPresence(tickCount % 6 === 0);
       if (carpoolScannerOpenRef.current && tickCount % 3 === 0) {
         broadcastScannerPing();
       }
@@ -1353,10 +1247,18 @@ export default function App() {
         .catch(() => {});
 
       const pendingId = pendingSentRef.current;
-      if (pendingId) {
+      if (pendingId && !pendingSessionPollInFlightRef.current) {
+        pendingSessionPollInFlightRef.current = true;
         carpoolFetch(`/api/carpool/linkup/session/${pendingId}`)
-          .then((r) => safeJson(r))
-          .then((data) => {
+          .then(async (r) => ({ ok: r.ok, status: r.status, data: await safeJson(r) }))
+          .then(({ ok, status, data }) => {
+            if (!ok || !data?.success) {
+              if (status === 404) {
+                setPendingSentRequestId(null);
+                showLinkupNotice('This Link Up request expired or is no longer available.');
+              }
+              return;
+            }
             if (data && data.success && data.session) {
               if (data.session.status === 'accepted') {
                 setAcceptedLinkUpSession(data.session);
@@ -1364,6 +1266,9 @@ export default function App() {
                 setCarpoolScannerOpen(true);
               } else if (data.session.status === 'declined') {
                 showLinkupNotice(`${data.session.toUser?.username || 'The commuter'} declined this link up request.`);
+                setPendingSentRequestId(null);
+              } else if (data.session.status === 'expired') {
+                showLinkupNotice('The Link Up request expired before it was answered.');
                 setPendingSentRequestId(null);
               } else if (data.session.status === 'cancelled') {
                 handleRemoteLinkUpCancelled({
@@ -1373,24 +1278,47 @@ export default function App() {
               }
             }
           })
-          .catch(() => {});
+          .catch((error) => {
+            console.warn('Could not refresh Link Up request status:', error?.message || 'network error');
+            showLinkupNotice('Connection interrupted. WayGo is retrying the Link Up status check.');
+          })
+          .finally(() => {
+            pendingSessionPollInFlightRef.current = false;
+          });
       }
 
       const activeId = acceptedLinkUpRef.current?.id;
-      if (activeId) {
+      if (activeId && !activeSessionPollInFlightRef.current) {
+        activeSessionPollInFlightRef.current = true;
         carpoolFetch(`/api/carpool/linkup/session/${activeId}`)
           .then((r) => safeJson(r))
           .then((data) => {
-            if (data && data.success && data.session && data.session.status === 'cancelled') {
-              handleRemoteLinkUpCancelled({
-                requestId: data.session.id,
-                cancelledByUsername: data.session.cancelledBy
-              });
+            if (data && data.success && data.session && ['cancelled', 'completed'].includes(data.session.status)) {
+              if (data.session.status === 'cancelled') {
+                handleRemoteLinkUpCancelled({
+                  requestId: data.session.id,
+                  cancelledByUsername: data.session.cancelledBy
+                });
+              } else if (acceptedLinkUpRef.current?.id === data.session.id) {
+                setAcceptedLinkUpSession(null);
+                showLinkupNotice('This Link Up session has ended.');
+              }
             }
           })
-          .catch(() => {});
+          .catch((error) => console.warn('Could not refresh active Link Up session:', error?.message || 'network error'))
+          .finally(() => {
+            activeSessionPollInFlightRef.current = false;
+          });
       }
-    }, 2500);
+    }, 5000);
+
+    const handleReconnect = () => {
+      broadcastMyPresence(true);
+      fetchNearbyWithin3Km();
+      checkIncomingLinkUps();
+    };
+    window.addEventListener('online', handleReconnect);
+    window.addEventListener('focus', handleReconnect);
 
     const handleBeforeUnload = () => {
       carpoolFetch('/api/carpool/presence/leave', {
@@ -1401,20 +1329,14 @@ export default function App() {
 
     return () => {
       disposed = true;
+      unsubscribeLocation();
+      locationManagerRef.current?.stop();
       rtSubscribedRef.current = false;
       clearInterval(heartbeatTimer);
 
+      window.removeEventListener('online', handleReconnect);
+      window.removeEventListener('focus', handleReconnect);
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      if (watchId !== null && navigator.geolocation) {
-        navigator.geolocation.clearWatch(watchId);
-      }
-      if (fallbackWatchId !== null && navigator.geolocation) {
-        navigator.geolocation.clearWatch(fallbackWatchId);
-      }
-      if (calibrationCleanupRef.current) {
-        calibrationCleanupRef.current();
-        calibrationCleanupRef.current = null;
-      }
       if (realtimeChannelRef.current === rtChannel) {
         realtimeChannelRef.current = null;
       }
@@ -1432,6 +1354,7 @@ export default function App() {
     currentUser?.username,
     deviceId,
     locateUserPosition,
+    fallbackToIpLocation,
     reverseGeocodeCoords,
     buildMyPresencePayload,
     broadcastMyPresence,
@@ -1571,6 +1494,33 @@ export default function App() {
     await sendRealtimeBroadcast('linkup_cancelled', cancelPayload);
     showLinkupNotice('You cancelled the link up session.');
   }, [deviceId, endActiveCall, sendRealtimeBroadcast, showLinkupNotice]);
+
+  const handleCancelPendingLinkUp = async () => {
+    const requestId = pendingSentRequestId;
+    if (!requestId) return;
+    try {
+      const sessionResponse = await carpoolFetch(`/api/carpool/linkup/session/${requestId}`);
+      const sessionData = await safeJson(sessionResponse);
+      if (!sessionResponse.ok || !sessionData?.session) throw new Error(sessionData?.message || 'Could not load the pending request.');
+      const response = await carpoolFetch('/api/carpool/linkup/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestId, cancelledByDeviceId: deviceId })
+      });
+      const result = await safeJson(response);
+      if (!response.ok || !result?.success) throw new Error(result?.message || 'Could not cancel the request.');
+      setPendingSentRequestId(null);
+      await sendRealtimeBroadcast('linkup_cancelled', {
+        requestId,
+        partnerDeviceId: sessionData.session.toDeviceId,
+        cancelledByDeviceId: deviceId,
+        cancelledByUsername: currentUser?.username || 'Partner'
+      });
+      showLinkupNotice('You cancelled the pending Link Up request.');
+    } catch (error: any) {
+      alert(error?.message || 'Could not cancel the request. Please try again.');
+    }
+  };
 
   // Escape key handler
   useEffect(() => {
@@ -1861,7 +1811,7 @@ export default function App() {
               </div>
             </div>
             <div className="login-copyright md:absolute md:bottom-6 text-xs text-slate-400 mt-6 md:mt-0">
-              © 2026 WayGo
+              Â© 2026 WayGo
             </div>
           </section>
 
@@ -2120,14 +2070,14 @@ export default function App() {
                 onClick={() => setOptionsMenuOpen(!optionsMenuOpen)}
                 className="w-11 h-11 rounded-xl border border-white/20 bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-xl transition cursor-pointer"
               >
-                ☰
+                â˜°
               </button>
               <button
                 type="button"
                 onClick={handleBackToLogin}
                 className="hidden sm:inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-white/25 bg-[#081222]/50 hover:bg-[#081222]/80 text-white text-xs font-bold backdrop-blur-md transition cursor-pointer"
               >
-                <span>←</span> Back
+                <span>â†</span> Back
               </button>
             </div>
 
@@ -2152,7 +2102,7 @@ export default function App() {
             onClick={() => setCurrentRideModalOpen(true)}
             className="fixed right-5 bottom-5 z-40 px-5 py-3 rounded-2xl border border-white/30 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-xl shadow-black/40 transition transform hover:-translate-y-1 cursor-pointer"
           >
-            🚗 My Current Ride
+            ðŸš— My Current Ride
           </button>
 
           {/* Options Dropdown Menu */}
@@ -2163,8 +2113,8 @@ export default function App() {
                 onClick={() => setScheduleSubmenuOpen(!scheduleSubmenuOpen)}
                 className="flex items-center justify-between p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                <span>📅 &nbsp; Schedule</span>
-                <span className="text-xs text-white/50">{scheduleSubmenuOpen ? '▲' : '▼'}</span>
+                <span>ðŸ“… &nbsp; Schedule</span>
+                <span className="text-xs text-white/50">{scheduleSubmenuOpen ? 'â–²' : 'â–¼'}</span>
               </div>
               {scheduleSubmenuOpen && (
                 <div className="ml-3 pl-3 border-l border-white/20 my-1 space-y-1">
@@ -2175,7 +2125,7 @@ export default function App() {
                     }}
                     className="p-2 rounded-lg hover:bg-white/10 text-xs text-white/80 cursor-pointer"
                   >
-                    👁️ &nbsp; View Schedule
+                    ðŸ‘ï¸ &nbsp; View Schedule
                   </div>
                   <div
                     onClick={() => {
@@ -2184,7 +2134,7 @@ export default function App() {
                     }}
                     className="p-2 rounded-lg hover:bg-white/10 text-xs text-white/80 cursor-pointer"
                   >
-                    ➕ &nbsp; Add Schedule
+                    âž• &nbsp; Add Schedule
                   </div>
                   <div
                     onClick={() => {
@@ -2193,7 +2143,7 @@ export default function App() {
                     }}
                     className="p-2 rounded-lg hover:bg-white/10 text-xs text-white/80 cursor-pointer"
                   >
-                    ✏️ &nbsp; Edit Schedule
+                    âœï¸ &nbsp; Edit Schedule
                   </div>
                 </div>
               )}
@@ -2205,7 +2155,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition flex items-center justify-between"
               >
-                <span>⚡ &nbsp; Scan Area to Link Up</span>
+                <span>âš¡ &nbsp; Scan Area to Link Up</span>
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">
                   50% OFF
                 </span>
@@ -2218,7 +2168,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                🚗 &nbsp; My Current Ride
+                ðŸš— &nbsp; My Current Ride
               </div>
 
               <div
@@ -2228,7 +2178,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                💬 &nbsp; Previously Contacted
+                ðŸ’¬ &nbsp; Previously Contacted
               </div>
 
               <div
@@ -2238,7 +2188,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                ⚙️ &nbsp; Settings
+                âš™ï¸ &nbsp; Settings
               </div>
             </div>
           )}
@@ -2249,7 +2199,7 @@ export default function App() {
             {incomingLinkUp && !carpoolScannerOpen && (
               <div className="w-full max-w-[520px] mb-5 p-4 rounded-2xl bg-gradient-to-r from-emerald-500/25 via-teal-500/20 to-cyan-500/25 border-2 border-emerald-400 shadow-2xl text-left animate-fadeIn">
                 <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-400/30 text-emerald-200 text-[10px] font-black uppercase tracking-wider mb-1.5">
-                  ⚡ Incoming Link Up Request
+                  âš¡ Incoming Link Up Request
                 </div>
                 <div className="text-sm sm:text-base font-bold text-white">
                   {incomingLinkUp.fromUser?.username || 'Nearby Commuter'} wants to link up with you!
@@ -2263,7 +2213,7 @@ export default function App() {
                     onClick={handleAcceptIncomingLinkUp}
                     className="flex-1 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-xs shadow-lg transition cursor-pointer"
                   >
-                    ✓ Accept & Connect
+                    âœ“ Accept & Connect
                   </button>
                   <button
                     type="button"
@@ -2279,7 +2229,7 @@ export default function App() {
             {/* Link-Up Notice Banner (e.g., partner cancelled) */}
             {linkupNotice && !carpoolScannerOpen && (
               <div className="w-full max-w-[520px] mb-4 px-4 py-3 rounded-2xl bg-amber-500/15 border border-amber-400/40 text-amber-100 text-xs font-semibold flex items-center justify-between gap-3 text-left animate-fadeIn">
-                <span>ℹ️ {linkupNotice}</span>
+                <span>â„¹ï¸ {linkupNotice}</span>
                 <button
                   type="button"
                   onClick={() => setLinkupNotice(null)}
@@ -2307,7 +2257,7 @@ export default function App() {
                 <div className="w-full max-w-[520px] mb-5 p-3.5 rounded-2xl bg-gradient-to-r from-emerald-500/20 via-teal-500/15 to-cyan-500/20 border border-emerald-400/50 shadow-xl flex flex-wrap items-center justify-between gap-3 text-left animate-fadeIn">
                   <div className="min-w-0">
                     <div className="text-[10px] font-black uppercase tracking-wider text-emerald-300">
-                      🤝 Active Pool Partner
+                      ðŸ¤ Active Pool Partner
                     </div>
                     <div className="text-sm font-bold text-white truncate">
                       {partner?.username || 'Carpool Partner'}
@@ -2378,7 +2328,7 @@ export default function App() {
 
             {/* Check for Vehicle Pooling Card */}
             <div className="w-full max-w-[460px] p-8 md:p-10 rounded-[32px] border border-white/25 bg-gradient-to-br from-[#0e1e33]/90 to-[#13293e]/85 backdrop-blur-2xl shadow-2xl text-center relative group hover:border-emerald-400/40 transition duration-300">
-              <div className="text-5xl mb-3 transition transform group-hover:scale-110 duration-300">🚘</div>
+              <div className="text-5xl mb-3 transition transform group-hover:scale-110 duration-300">ðŸš˜</div>
               <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-400/30 text-[11px] text-emerald-300 font-bold mb-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                 <span>Preset: MIT-WPU Kothrud, Pune</span>
@@ -2399,7 +2349,7 @@ export default function App() {
                 ) : (
                   <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-[11px] text-white/60">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                    <span>3 km Live Radar Active • Your account is visible</span>
+                    <span>3 km Live Radar Active â€¢ Your account is visible</span>
                   </div>
                 )}
               </div>
@@ -2417,8 +2367,8 @@ export default function App() {
                 >
                   <span>
                     {nearbyCommuters.length > 0
-                      ? `⚡ View ${nearbyCommuters.length} Nearby Account${nearbyCommuters.length > 1 ? 's' : ''} (3 km) →`
-                      : '⚡ Scan 3 km Area & Link Up (Split 50/50) →'}
+                      ? `âš¡ View ${nearbyCommuters.length} Nearby Account${nearbyCommuters.length > 1 ? 's' : ''} (3 km) â†’`
+                      : 'âš¡ Scan 3 km Area & Link Up (Split 50/50) â†’'}
                   </span>
                 </button>
                 <button
@@ -2426,14 +2376,14 @@ export default function App() {
                   onClick={() => setPoolingModalOpen(true)}
                   className="w-full py-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/20 text-white font-semibold text-xs transition cursor-pointer flex items-center justify-center gap-1.5"
                 >
-                  <span>🗺️ Choose Vehicle & Open Map</span>
+                  <span>ðŸ—ºï¸ Choose Vehicle & Open Map</span>
                 </button>
               </div>
             </div>
           </main>
 
           <footer className="relative z-10 py-4 pb-[max(1rem,env(safe-area-inset-bottom,0px))] text-center text-xs text-white/40">
-            WayGo Mobility Network • Real-Time Pooling
+            WayGo Mobility Network â€¢ Real-Time Pooling
           </footer>
         </div>
       )}
@@ -2516,6 +2466,8 @@ export default function App() {
         gpsAccuracyMeters={gpsAccuracyMeters}
         calibratingGps={calibratingGps}
         locationSource={locationSource}
+        locationStatus={locationStatus}
+        locationFixTimestamp={locationFixTimestamp}
         locationError={locationError}
         onSetCustomLocation={handleSetCustomLocation}
         locatingUser={locatingUser}
@@ -2530,6 +2482,7 @@ export default function App() {
         activeSession={acceptedLinkUpSession}
         onSetActiveSession={setAcceptedLinkUpSession}
         onCancelLinkUp={handleCancelAcceptedLinkUp}
+        onCancelPendingLinkUp={handleCancelPendingLinkUp}
         linkupNotice={linkupNotice}
         onDismissLinkupNotice={() => setLinkupNotice(null)}
         pendingSentRequestId={pendingSentRequestId}
