@@ -1,0 +1,11 @@
+{
+  "name": "Remix WayGo - Ride Pooling \u0026 Smart Commute",
+  "description": "Smart vehicle pooling platform for car and bike sharing with route tracking, schedule management, and verified email OTP authentication using Supabase.",
+  "requestFramePermissions": [
+    "geolocation",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
