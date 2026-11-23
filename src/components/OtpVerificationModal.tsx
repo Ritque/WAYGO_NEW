@@ -6,7 +6,7 @@ interface OtpVerificationModalProps {
   isOpen: boolean;
   target: string;
   onClose: () => void;
-  onVerified: (target: string) => void;
+  onVerified: (user: any, session: any) => void | Promise<void>;
 }
 
 export const OtpVerificationModal: React.FC<OtpVerificationModalProps> = ({
@@ -22,13 +22,14 @@ export const OtpVerificationModal: React.FC<OtpVerificationModalProps> = ({
   const [successMsg, setSuccessMsg] = useState('');
   const [countdown, setCountdown] = useState(30);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const sendLock = useRef(false);
+  const verifyLock = useRef(false);
 
   useEffect(() => {
     if (isOpen && target) {
       setDigits(['', '', '', '', '', '', '', '']);
       setErrorMsg('');
-      setSuccessMsg('');
-      sendOtp();
+      setSuccessMsg(`Confirmation code sent to ${target.trim().toLowerCase()}. Please check your email inbox.`);
     }
   }, [isOpen, target]);
 
@@ -41,19 +42,24 @@ export const OtpVerificationModal: React.FC<OtpVerificationModalProps> = ({
   }, [countdown]);
 
   const sendOtp = async () => {
+    if (sendLock.current || !target) return;
+    sendLock.current = true;
     setSending(true);
     setErrorMsg('');
     try {
-      const { error } = await supabase.auth.signInWithOtp({
+      const { error } = await supabase.auth.resend({
+        type: 'signup',
         email: target.trim().toLowerCase(),
-        options: { shouldCreateUser: true },
       });
       if (error) throw error;
       setCountdown(30);
       setSuccessMsg(`Verification code sent to ${target.trim().toLowerCase()}! Please check your email inbox.`);
     } catch (err: any) {
       setErrorMsg(err?.message || 'Error sending OTP. Please try again.');
-    } finally { setSending(false); }
+    } finally {
+      sendLock.current = false;
+      setSending(false);
+    }
   };
   /**
    * Only accept numeric digits (0-9). Blocks any non-digit character.
@@ -136,6 +142,7 @@ export const OtpVerificationModal: React.FC<OtpVerificationModalProps> = ({
   };
 
   const handleVerify = async () => {
+    if (verifyLock.current) return;
     const fullCode = digits.join('');
 
     // Supabase projects can use six or eight digit email tokens.
@@ -150,32 +157,29 @@ export const OtpVerificationModal: React.FC<OtpVerificationModalProps> = ({
     }
 
     setLoading(true);
+    verifyLock.current = true;
     setErrorMsg('');
 
     try {
       const cleanEmail = target.trim().toLowerCase();
 
-      let { error } = await supabase.auth.verifyOtp({
-        email: cleanEmail, token: fullCode, type: 'email',
+      const { data, error } = await supabase.auth.verifyOtp({
+        email: cleanEmail, token: fullCode, type: 'signup',
       });
-      if (error) {
-        const signupAttempt = await supabase.auth.verifyOtp({
-          email: cleanEmail, token: fullCode, type: 'signup',
-        });
-        if (!signupAttempt.error) error = null;
-      }
       if (error) {
         setErrorMsg(error.message || 'Incorrect verification code. Please check your email inbox.');
       } else {
         setSuccessMsg('Email verified successfully!');
-        setTimeout(() => {
-          onVerified(target);
-          onClose();
-        }, 700);
+        if (!data.session || !data.user) {
+          throw new Error('Verification succeeded, but Supabase did not return an authenticated session.');
+        }
+        await onVerified(data.user, data.session);
+        onClose();
       }
     } catch (err: any) {
       setErrorMsg(err?.message || 'Verification failed. Please check your connection.');
     } finally {
+      verifyLock.current = false;
       setLoading(false);
     }
   };

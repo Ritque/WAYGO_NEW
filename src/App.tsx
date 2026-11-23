@@ -56,9 +56,11 @@ export default function App() {
   const [showRegConfirmPassword, setShowRegConfirmPassword] = useState(false);
 
   // OTP Verification States
-  const [emailVerified, setEmailVerified] = useState(false);
   const [otpModalOpen, setOtpModalOpen] = useState(false);
   const [otpTarget, setOtpTarget] = useState('');
+  const [pendingRegistration, setPendingRegistration] = useState<{ email: string; password: string; username: string } | null>(null);
+  const [verifiedEmail, setVerifiedEmail] = useState('');
+  const registrationLock = useRef(false);
 
   // Modals & Panels State
   const [optionsMenuOpen, setOptionsMenuOpen] = useState(false);
@@ -176,6 +178,8 @@ export default function App() {
 
   // Initial load
   useEffect(() => {
+    const restoredUsers = new Set<string>();
+    const restoringUsers = new Set<string>();
     // Day greeting
     const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     setDayGreeting(`Happy ${days[new Date().getDay()]}!`);
@@ -184,6 +188,8 @@ export default function App() {
     const loadSession = (session: any) => {
       const authUser = session?.user;
       if (!authUser) { setCurrentUser(null); setCurrentPage('login'); setCurrentRide(null); return; }
+      if (restoredUsers.has(authUser.id) || restoringUsers.has(authUser.id)) return;
+      restoringUsers.add(authUser.id);
       const username = authUser.user_metadata?.username || authUser.email?.split('@')[0] || 'User';
       const user: User = { id: authUser.id, username, email: authUser.email || '', emailVerified: !!authUser.email_confirmed_at };
       setCurrentUser(user);
@@ -229,7 +235,10 @@ export default function App() {
         const ride = await getUserData<RideBooking>(authUser.id, 'current_ride');
         setCurrentRide(ride);
       };
-      restoreData().catch((err) => console.error('Could not load or migrate account data:', err));
+      restoreData()
+        .then(() => restoredUsers.add(authUser.id))
+        .catch((err) => console.error('Could not load or migrate account data:', err))
+        .finally(() => restoringUsers.delete(authUser.id));
     };
     supabase.auth.getSession().then(({ data }) => loadSession(data.session));
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -1632,6 +1641,7 @@ export default function App() {
   // Register handler
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (registrationLock.current) return;
     if (!isSupabaseConfigured) { alert('Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY before registering.'); return; }
     if (regUsername.trim().length < 2) {
       alert('Username must be at least 2 characters.');
@@ -1650,32 +1660,49 @@ export default function App() {
       alert('Passwords do not match.');
       return;
     }
-    if (!emailVerified) {
-      alert('Please verify your email address with the code sent by Supabase before creating your account.');
-      return;
-    }
-
+    registrationLock.current = true;
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      const { error } = session?.user.email?.toLowerCase() === cleanEmail
-        ? await supabase.auth.updateUser({ password: regPassword, data: { username: regUsername.trim() } })
-        : await supabase.auth.signUp({
-            email: cleanEmail,
-            password: regPassword,
-            options: { data: { username: regUsername.trim() } }
-          });
+      const username = regUsername.trim();
+      const { data, error } = await supabase.auth.signUp({
+        email: cleanEmail,
+        password: regPassword,
+        options: { data: { username } }
+      });
       if (error) throw error;
-      if (session?.user.email?.toLowerCase() === cleanEmail) await supabase.auth.signOut();
 
-      alert(
-        'Account created successfully!\n\nYour email verification was completed. You can now sign in.'
-      );
-      setLoginEmail(cleanEmail);
-      setLoginPassword('');
-      setCurrentPage('login');
+      if (data.session && data.user) {
+        await completeRegistration(data.user, cleanEmail, regPassword, username);
+        return;
+      }
+
+      if (data.user && !data.user.email_confirmed_at) {
+        setPendingRegistration({ email: cleanEmail, password: regPassword, username });
+        setOtpTarget(cleanEmail);
+        setOtpModalOpen(true);
+        return;
+      }
+
+      throw new Error('Supabase did not return a registration session or a pending email confirmation.');
     } catch (err: any) {
       alert(err?.message || 'Registration failed.');
+    } finally {
+      registrationLock.current = false;
     }
+  };
+
+  const completeRegistration = async (authUser: any, email: string, password: string, username: string) => {
+    const user: User = {
+      id: authUser.id,
+      username: authUser.user_metadata?.username || username,
+      email: authUser.email || email,
+      emailVerified: !!authUser.email_confirmed_at
+    };
+    setCurrentUser(user);
+    setCurrentPage('home');
+    setLoginEmail(email);
+    setLoginPassword('');
+    setPendingRegistration(null);
+    alert('Account created successfully! Your email has been verified.');
   };
 
   const handleStartOtp = () => {
@@ -1688,8 +1715,24 @@ export default function App() {
     setOtpModalOpen(true);
   };
 
-  const handleOtpVerified = () => {
-    setEmailVerified(true);
+  const cleanRegistrationEmail = regEmail.trim().toLowerCase();
+  const hasRegistrationEmail = regEmail.trim().length > 0;
+  const isRegistrationEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanRegistrationEmail);
+  const isRegistrationEmailVerified = Boolean(verifiedEmail) && cleanRegistrationEmail === verifiedEmail;
+  const shouldShowEmailVerification = hasRegistrationEmail && isRegistrationEmailValid && !isRegistrationEmailVerified;
+
+  const handleOtpVerified = async (verifiedUser: any, verifiedSession: any) => {
+    if (!pendingRegistration) return;
+    try {
+      const authUser = verifiedUser || verifiedSession?.user;
+      if (!verifiedSession || !authUser || authUser.email?.toLowerCase() !== pendingRegistration.email) {
+        throw new Error('Email verification succeeded, but Supabase did not return the expected authenticated registration session. Please sign in.');
+      }
+      setVerifiedEmail(pendingRegistration.email);
+      await completeRegistration(verifiedSession.user || authUser, pendingRegistration.email, pendingRegistration.password, pendingRegistration.username);
+    } catch (err: any) {
+      alert(err?.message || 'Could not complete registration.');
+    }
   };
 
   const resetEphemeralCarpoolState = () => {
@@ -1954,7 +1997,7 @@ export default function App() {
               <div className="login-field text-left">
                 <div className="flex items-center justify-between mb-1">
                   <label className="block text-xs font-semibold text-slate-200">Email address</label>
-                  {emailVerified ? (
+                  {isRegistrationEmailVerified ? (
                     <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-bold">
                       <CheckCircle2 className="w-3 h-3" /> Email Verified (8-Digit OTP)
                     </span>
@@ -1973,14 +2016,15 @@ export default function App() {
                     type="email"
                     value={regEmail}
                     onChange={(e) => {
-                      setRegEmail(e.target.value);
-                      setEmailVerified(false);
+                      const nextEmail = e.target.value;
+                      setRegEmail(nextEmail);
+                      if (nextEmail !== regEmail) setVerifiedEmail('');
                     }}
                     placeholder="Enter your email"
                     required
                     className="input w-full h-11 px-3.5 rounded-xl bg-white/10 border border-white/20 text-xs text-white placeholder:text-white/40 focus:outline-none focus:border-cyan-400"
                   />
-                  {!emailVerified && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(regEmail.trim()) && (
+                  {shouldShowEmailVerification && (
                     <button
                       type="button"
                       onClick={handleStartOtp}
@@ -1990,6 +2034,11 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                {shouldShowEmailVerification && (
+                  <p className="mt-1.5 text-[11px] text-white/50">
+                    Verify your email address with an 8-digit code to continue.
+                  </p>
+                )}
               </div>
 
               {/* Password */}

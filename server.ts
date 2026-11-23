@@ -493,13 +493,17 @@ app.post('/api/carpool/linkup/request', async (req: AuthenticatedRequest, res: R
     if (isOwnedTest) computeAndAcceptLinkUp(session);
     const { error } = await supabaseAdmin!.from('carpool_linkup_sessions').insert({
       request_id: requestId, from_user_id: req.authUserId, to_user_id: targetRow.user_id,
-      from_device_id: fromDeviceId, to_device_id: toDeviceId, session,
+      from_device_id: fromDeviceId, to_device_id: toDeviceId, status: session.status, session,
       expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString()
     });
     if (error) throw error;
     return res.json({ success: true, message: session.status === 'accepted' ? 'Link Up accepted! Both devices are synchronized.' : 'Link Up request sent to ' + targetPresence.username, requestId, session });
   } catch (error: any) {
-    console.error('Failed to initiate link up:', error);
+    console.error('Failed to initiate link up:', {
+      code: error?.code,
+      message: error?.message || 'Unknown database or server error',
+      hint: error?.hint
+    });
     return res.status(500).json({ success: false, message: 'Failed to initiate link up.' });
   }
 });
