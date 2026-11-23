@@ -417,7 +417,7 @@ export default function App() {
       username: user.username || 'Live Commuter',
       email: (user.email || '').trim().toLowerCase(),
       lastSeenAt: Date.now(),
-      avatar: 'ðŸ‘¤',
+      avatar: '👤',
       pickup: livePickupRef.current,
       drop: FIXED_DEST_NAME,
       pickupCoords: liveCoordsRef.current,
@@ -1838,7 +1838,7 @@ export default function App() {
               </div>
             </div>
             <div className="login-copyright md:absolute md:bottom-6 text-xs text-slate-400 mt-6 md:mt-0">
-              Â© 2026 WayGo
+              © 2026 WayGo
             </div>
           </section>
 
@@ -2107,14 +2107,14 @@ export default function App() {
                 onClick={() => setOptionsMenuOpen(!optionsMenuOpen)}
                 className="w-11 h-11 rounded-xl border border-white/20 bg-white/10 hover:bg-white/20 flex items-center justify-center text-white text-xl transition cursor-pointer"
               >
-                â˜°
+                ☰
               </button>
               <button
                 type="button"
                 onClick={handleBackToLogin}
                 className="hidden sm:inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-white/25 bg-[#081222]/50 hover:bg-[#081222]/80 text-white text-xs font-bold backdrop-blur-md transition cursor-pointer"
               >
-                <span>â†</span> Back
+                <span>←</span> Back
               </button>
             </div>
 
@@ -2139,7 +2139,7 @@ export default function App() {
             onClick={() => setCurrentRideModalOpen(true)}
             className="fixed right-5 bottom-5 z-40 px-5 py-3 rounded-2xl border border-white/30 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-xl shadow-black/40 transition transform hover:-translate-y-1 cursor-pointer"
           >
-            ðŸš— My Current Ride
+            🚗 My Current Ride
           </button>
 
           {/* Options Dropdown Menu */}
@@ -2150,8 +2150,8 @@ export default function App() {
                 onClick={() => setScheduleSubmenuOpen(!scheduleSubmenuOpen)}
                 className="flex items-center justify-between p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                <span>ðŸ“… &nbsp; Schedule</span>
-                <span className="text-xs text-white/50">{scheduleSubmenuOpen ? 'â–²' : 'â–¼'}</span>
+                <span>📅 &nbsp; Schedule</span>
+                <span className="text-xs text-white/50">{scheduleSubmenuOpen ? '▲' : '▼'}</span>
               </div>
               {scheduleSubmenuOpen && (
                 <div className="ml-3 pl-3 border-l border-white/20 my-1 space-y-1">
@@ -2162,7 +2162,7 @@ export default function App() {
                     }}
                     className="p-2 rounded-lg hover:bg-white/10 text-xs text-white/80 cursor-pointer"
                   >
-                    ðŸ‘ï¸ &nbsp; View Schedule
+                    👁️ &nbsp; View Schedule
                   </div>
                   <div
                     onClick={() => {
@@ -2171,7 +2171,7 @@ export default function App() {
                     }}
                     className="p-2 rounded-lg hover:bg-white/10 text-xs text-white/80 cursor-pointer"
                   >
-                    âž• &nbsp; Add Schedule
+                    ➕ &nbsp; Add Schedule
                   </div>
                   <div
                     onClick={() => {
@@ -2180,7 +2180,7 @@ export default function App() {
                     }}
                     className="p-2 rounded-lg hover:bg-white/10 text-xs text-white/80 cursor-pointer"
                   >
-                    âœï¸ &nbsp; Edit Schedule
+                    ✏️ &nbsp; Edit Schedule
                   </div>
                 </div>
               )}
@@ -2192,7 +2192,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition flex items-center justify-between"
               >
-                <span>âš¡ &nbsp; Scan Area to Link Up</span>
+                <span>⚡ &nbsp; Scan Area to Link Up</span>
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">
                   50% OFF
                 </span>
@@ -2205,7 +2205,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                ðŸš— &nbsp; My Current Ride
+                🚗 &nbsp; My Current Ride
               </div>
 
               <div
@@ -2215,7 +2215,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                ðŸ’¬ &nbsp; Previously Contacted
+                💬 &nbsp; Previously Contacted
               </div>
 
               <div
@@ -2225,7 +2225,7 @@ export default function App() {
                 }}
                 className="p-3 rounded-xl hover:bg-white/10 cursor-pointer text-sm font-semibold transition"
               >
-                âš™ï¸ &nbsp; Settings
+                ⚙️ &nbsp; Settings
               </div>
             </div>
           )}
@@ -2236,7 +2236,7 @@ export default function App() {
             {incomingLinkUp && !carpoolScannerOpen && (
               <div className="w-full max-w-[520px] mb-5 p-4 rounded-2xl bg-gradient-to-r from-emerald-500/25 via-teal-500/20 to-cyan-500/25 border-2 border-emerald-400 shadow-2xl text-left animate-fadeIn">
                 <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-400/30 text-emerald-200 text-[10px] font-black uppercase tracking-wider mb-1.5">
-                  âš¡ Incoming Link Up Request
+                  ⚡ Incoming Link Up Request
                 </div>
                 <div className="text-sm sm:text-base font-bold text-white">
                   {incomingLinkUp.fromUser?.username || 'Nearby Commuter'} wants to link up with you!
@@ -2250,7 +2250,7 @@ export default function App() {
                     onClick={handleAcceptIncomingLinkUp}
                     className="flex-1 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white font-bold text-xs shadow-lg transition cursor-pointer"
                   >
-                    âœ“ Accept & Connect
+                    ✓ Accept & Connect
                   </button>
                   <button
                     type="button"
@@ -2266,7 +2266,7 @@ export default function App() {
             {/* Link-Up Notice Banner (e.g., partner cancelled) */}
             {linkupNotice && !carpoolScannerOpen && (
               <div className="w-full max-w-[520px] mb-4 px-4 py-3 rounded-2xl bg-amber-500/15 border border-amber-400/40 text-amber-100 text-xs font-semibold flex items-center justify-between gap-3 text-left animate-fadeIn">
-                <span>â„¹ï¸ {linkupNotice}</span>
+                <span>ℹ️ {linkupNotice}</span>
                 <button
                   type="button"
                   onClick={() => setLinkupNotice(null)}
@@ -2294,7 +2294,7 @@ export default function App() {
                 <div className="w-full max-w-[520px] mb-5 p-3.5 rounded-2xl bg-gradient-to-r from-emerald-500/20 via-teal-500/15 to-cyan-500/20 border border-emerald-400/50 shadow-xl flex flex-wrap items-center justify-between gap-3 text-left animate-fadeIn">
                   <div className="min-w-0">
                     <div className="text-[10px] font-black uppercase tracking-wider text-emerald-300">
-                      ðŸ¤ Active Pool Partner
+                      🤝 Active Pool Partner
                     </div>
                     <div className="text-sm font-bold text-white truncate">
                       {partner?.username || 'Carpool Partner'}
@@ -2365,7 +2365,7 @@ export default function App() {
 
             {/* Check for Vehicle Pooling Card */}
             <div className="w-full max-w-[460px] p-8 md:p-10 rounded-[32px] border border-white/25 bg-gradient-to-br from-[#0e1e33]/90 to-[#13293e]/85 backdrop-blur-2xl shadow-2xl text-center relative group hover:border-emerald-400/40 transition duration-300">
-              <div className="text-5xl mb-3 transition transform group-hover:scale-110 duration-300">ðŸš˜</div>
+              <div className="text-5xl mb-3 transition transform group-hover:scale-110 duration-300">🚘</div>
               <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-400/30 text-[11px] text-emerald-300 font-bold mb-2">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                 <span>Preset: MIT-WPU Kothrud, Pune</span>
@@ -2386,7 +2386,7 @@ export default function App() {
                 ) : (
                   <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-[11px] text-white/60">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                    <span>3 km Live Radar Active â€¢ Your account is visible</span>
+                    <span>3 km Live Radar Active • Your account is visible</span>
                   </div>
                 )}
               </div>
@@ -2404,8 +2404,8 @@ export default function App() {
                 >
                   <span>
                     {nearbyCommuters.length > 0
-                      ? `âš¡ View ${nearbyCommuters.length} Nearby Account${nearbyCommuters.length > 1 ? 's' : ''} (3 km) â†’`
-                      : 'âš¡ Scan 3 km Area & Link Up (Split 50/50) â†’'}
+                      ? `⚡ View ${nearbyCommuters.length} Nearby Account${nearbyCommuters.length > 1 ? 's' : ''} (3 km) →`
+                      : '⚡ Scan 3 km Area & Link Up (Split 50/50) →'}
                   </span>
                 </button>
                 <button
@@ -2413,14 +2413,14 @@ export default function App() {
                   onClick={() => setPoolingModalOpen(true)}
                   className="w-full py-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/20 text-white font-semibold text-xs transition cursor-pointer flex items-center justify-center gap-1.5"
                 >
-                  <span>ðŸ—ºï¸ Choose Vehicle & Open Map</span>
+                  <span>🗺️ Choose Vehicle & Open Map</span>
                 </button>
               </div>
             </div>
           </main>
 
           <footer className="relative z-10 py-4 pb-[max(1rem,env(safe-area-inset-bottom,0px))] text-center text-xs text-white/40">
-            WayGo Mobility Network â€¢ Real-Time Pooling
+            WayGo Mobility Network • Real-Time Pooling
           </footer>
         </div>
       )}
