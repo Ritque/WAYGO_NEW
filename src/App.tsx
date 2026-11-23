@@ -1589,9 +1589,13 @@ export default function App() {
   };
 
   // Register handler
-  const handleRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const initiateRegistration = async () => {
     if (registrationLock.current) return;
+    if (pendingRegistration) {
+      setOtpTarget(pendingRegistration.email);
+      setOtpModalOpen(true);
+      return;
+    }
     if (!isSupabaseConfigured) { alert('Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY before registering.'); return; }
     if (regUsername.trim().length < 2) {
       alert('Username must be at least 2 characters.');
@@ -1620,6 +1624,12 @@ export default function App() {
       });
       if (error) throw error;
 
+      // Supabase may return a user-shaped response for an existing confirmed
+      // address to prevent account enumeration. Do not open OTP for that case.
+      if (data.user && !data.session && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        throw new Error('An account may already exist for this email. Try signing in or use password reset.');
+      }
+
       if (data.session && data.user) {
         await completeRegistration(data.user, cleanEmail, regPassword, username);
         return;
@@ -1640,6 +1650,11 @@ export default function App() {
     }
   };
 
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await initiateRegistration();
+  };
+
   const completeRegistration = async (authUser: any, email: string, password: string, username: string) => {
     const user: User = {
       id: authUser.id,
@@ -1655,14 +1670,26 @@ export default function App() {
     alert('Account created successfully! Your email has been verified.');
   };
 
-  const handleStartOtp = () => {
+  const handleStartOtp = async () => {
     const cleanEmail = regEmail.trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       alert('Please enter a valid email address first.');
       return;
     }
-    setOtpTarget(cleanEmail);
-    setOtpModalOpen(true);
+    if (regUsername.trim().length < 2) { alert('Username must be at least 2 characters.'); return; }
+    if (regPassword.length < 8) { alert('Password must be at least 8 characters.'); return; }
+    if (regPassword !== regConfirmPassword) { alert('Passwords do not match.'); return; }
+    if (pendingRegistration) {
+      if (pendingRegistration.email === cleanEmail && pendingRegistration.password === regPassword && pendingRegistration.username === regUsername.trim()) {
+        setOtpTarget(cleanEmail);
+        setOtpModalOpen(true);
+      } else {
+        setPendingRegistration(null);
+        alert('Registration details changed. Click Verify Email again to request a new confirmation code.');
+      }
+      return;
+    }
+    await initiateRegistration();
   };
 
   const cleanRegistrationEmail = regEmail.trim().toLowerCase();
@@ -1935,7 +1962,10 @@ export default function App() {
                 <input
                   type="text"
                   value={regUsername}
-                  onChange={(e) => setRegUsername(e.target.value)}
+                    onChange={(e) => {
+                      setRegUsername(e.target.value);
+                      if (pendingRegistration) setPendingRegistration(null);
+                    }}
                   placeholder="Choose a username"
                   maxLength={30}
                   required
@@ -1969,6 +1999,7 @@ export default function App() {
                       const nextEmail = e.target.value;
                       setRegEmail(nextEmail);
                       if (nextEmail !== regEmail) setVerifiedEmail('');
+                      if (pendingRegistration) setPendingRegistration(null);
                     }}
                     placeholder="Enter your email"
                     required
@@ -1998,7 +2029,10 @@ export default function App() {
                   <input
                     type={showRegPassword ? 'text' : 'password'}
                     value={regPassword}
-                    onChange={(e) => setRegPassword(e.target.value)}
+                    onChange={(e) => {
+                      setRegPassword(e.target.value);
+                      if (pendingRegistration) setPendingRegistration(null);
+                    }}
                     placeholder="Create a password"
                     minLength={4}
                     required
@@ -2021,7 +2055,10 @@ export default function App() {
                   <input
                     type={showRegConfirmPassword ? 'text' : 'password'}
                     value={regConfirmPassword}
-                    onChange={(e) => setRegConfirmPassword(e.target.value)}
+                    onChange={(e) => {
+                      setRegConfirmPassword(e.target.value);
+                      if (pendingRegistration) setPendingRegistration(null);
+                    }}
                     placeholder="Re-enter your password"
                     minLength={4}
                     required
